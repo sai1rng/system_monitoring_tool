@@ -14,35 +14,49 @@ import (
 	"github.com/shirou/gopsutil/v3/process"
 )
 
-// processInfo holds the name and start time for a tracked process.
+// processInfo holds the name, start time, and parent PID for a tracked process.
 type processInfo struct {
 	Name      string
 	StartTime time.Time
+	PPID      int32
 }
 
 // dataRecord holds all the information we want to save for an event.
 type dataRecord struct {
-	Timestamp            string
-	PID                  int32
-	ProcessName          string
-	Status               string    // "Started", "Exited", "Active", "Heartbeat"
-	Duration             string    // Total runtime, only for "Exited" status
-	CPUPercent           float64   // For "Started" and "Active" status
-	MemoryPercent        float32   // For "Started" and "Active" status
-	OverallSystemCPU     float64   // Overall system CPU usage
-	PerCoreSystemCPU     []float64 // Per-core system CPU usage
-	TotalSystemMemUsedGB float64
+	Timestamp             string
+	PID                   int32
+	PPID                  int32
+	ThreadID              int32 // The ID of the specific thread
+	ProcessName           string
+	ProcessStartTime      string // The time the process was created
+	ProcessPlatformStatus string // Status from gopsutil (e.g., "running", "sleeping")
+	NumThreads            int32
+	Status                string    // "Started", "Exited", "Active", "Heartbeat"
+	Duration              string    // Total runtime, only for "Exited" status
+	CPUPercent            float64   // Process-level CPU usage
+	MemoryPercent         float32   // Process-level Memory usage
+	ThreadUserTime        float64   // Cumulative user time for the thread
+	ThreadSystemTime      float64   // Cumulative system time for the thread
+	OverallSystemCPU      float64   // Overall system CPU usage
+	PerCoreSystemCPU      []float64 // Per-core system CPU usage
+	TotalSystemMemUsedGB  float64
 }
 
 const (
-	logInterval = 1 * time.Second    // How often to collect data
-	csvFilename = "system_log.csv" // The name of the output file
+	logInterval = 1 * time.Millisecond // How often to collect data
 )
 
-// activeProcesses tracks all running processes that we've seen, mapping PID to its info.
-var activeProcesses = make(map[int32]processInfo)
+var (
+	// activeProcesses tracks all running processes that we've seen, mapping PID to its info.
+	activeProcesses = make(map[int32]processInfo)
+	// csvFilename is set at runtime to be unique for each execution.
+	csvFilename string
+)
 
 func main() {
+	// Set a unique filename at the start of the program.
+	csvFilename = fmt.Sprintf("system_log_%s.csv", time.Now().Format("20060102_150405"))
+
 	log.Println("Starting system monitor...")
 	log.Printf("Data will be collected every %v and saved to %s", logInterval, csvFilename)
 	log.Printf("Detected %d CPU cores.", runtime.NumCPU())
@@ -66,13 +80,9 @@ func main() {
 
 // initializeCSV creates the CSV file and writes the dynamic header row.
 func initializeCSV() {
-	_, err := os.Stat(csvFilename)
-	if !os.IsNotExist(err) {
-		log.Printf("Found existing CSV file: %s. Appending new data.", csvFilename)
-		return
-	}
-
-	log.Printf("CSV file not found. Creating %s with headers.", csvFilename)
+	// Since the filename is unique per run, we always create a new file.
+	// No need to check if it exists.
+	log.Printf("Creating new CSV file: %s", csvFilename)
 	file, err := os.Create(csvFilename)
 	if err != nil {
 		log.Fatalf("Failed to create CSV file: %v", err)
@@ -86,11 +96,18 @@ func initializeCSV() {
 	headers := []string{
 		"Timestamp",
 		"PID",
+		"ParentPID",
+		"ThreadID",
 		"ProcessName",
+		"ProcessStartTime",
+		"ProcessPlatformStatus",
+		"NumThreads",
 		"Status",
 		"Duration",
 		"ProcessCPUPercent",
 		"ProcessMemoryPercent",
+		"ThreadUserTime",
+		"ThreadSystemTime",
 		"OverallSystemCPUUsagePercent",
 	}
 
@@ -112,15 +129,29 @@ func populateInitialProcesses() {
 		log.Printf("Warning: Could not get initial process list: %v", err)
 		return
 	}
-	scriptStartTime := time.Now()
 	for _, p := range processes {
-		name, err := p.Name()
+		name, err := p.Exe()
 		if err != nil {
 			name = "N/A"
 		}
+
+		ppid, err := p.Ppid()
+		if err != nil {
+			ppid = 0
+		}
+
+		createTimeMs, err := p.CreateTime()
+		var startTime time.Time
+		if err != nil {
+			startTime = time.Now() // Fallback if create time is unavailable
+		} else {
+			startTime = time.Unix(0, createTimeMs*int64(time.Millisecond))
+		}
+
 		activeProcesses[p.Pid] = processInfo{
 			Name:      name,
-			StartTime: scriptStartTime, // Assume they started when the script did
+			StartTime: startTime,
+			PPID:      ppid,
 		}
 	}
 	log.Printf("Initial scan complete. Tracking %d running processes.", len(activeProcesses))
@@ -133,8 +164,8 @@ func collectAndLogData() {
 	currentTime := time.Now()
 
 	// --- 1. Get Total System Stats ---
-	overallPercentages, _ := cpu.Percent(time.Second, false)
-	perCorePercentages, _ := cpu.Percent(time.Second, true)
+	overallPercentages, _ := cpu.Percent(time.Millisecond, false)
+	perCorePercentages, _ := cpu.Percent(time.Millisecond, true)
 	vm, _ := mem.VirtualMemory()
 	overallCPUUsage := overallPercentages[0]
 	totalMemUsedGB := float64(vm.Used) / (1024 * 1024 * 1024)
@@ -154,13 +185,15 @@ func collectAndLogData() {
 	// Check for EXITED processes
 	for pid, info := range activeProcesses {
 		if _, exists := currentPIDs[pid]; !exists {
-			duration := currentTime.Sub(info.StartTime).Round(time.Second).String()
+			duration := currentTime.Sub(info.StartTime).Round(time.Millisecond).String()
 			records = append(records, dataRecord{
-				Timestamp:   currentTime.Format(time.RFC3339),
-				PID:         pid,
-				ProcessName: info.Name,
-				Status:      "Exited",
-				Duration:    duration,
+				Timestamp:        currentTime.Format(time.RFC3339),
+				PID:              pid,
+				PPID:             info.PPID,
+				ProcessName:      info.Name,
+				ProcessStartTime: info.StartTime.Format(time.RFC3339),
+				Status:           "Exited",
+				Duration:         duration,
 			})
 			delete(activeProcesses, pid) // Remove from our tracking map
 		}
@@ -170,36 +203,114 @@ func collectAndLogData() {
 	for pid, p := range currentPIDs {
 		cpuP, _ := p.CPUPercent()
 		memP, _ := p.MemoryPercent()
+		ppid, _ := p.Ppid()
+		numThreads, _ := p.NumThreads()
+		processStatuses, err := p.Status()
+		var platformStatus string
+		if err != nil || len(processStatuses) == 0 {
+			platformStatus = "N/A"
+		} else {
+			platformStatus = processStatuses[0]
+		}
+
+		threads, err := p.Threads()
+		if err != nil {
+			log.Printf("Warning: Could not get threads for PID %d: %v", pid, err)
+		}
 
 		if info, exists := activeProcesses[pid]; exists {
 			// It's an ACTIVE, already tracked process. Log its current state.
-			records = append(records, dataRecord{
-				Timestamp:            currentTime.Format(time.RFC3339),
-				PID:                  pid,
-				ProcessName:          info.Name, // Use the stored name for consistency
-				Status:               "Active",
-				CPUPercent:           cpuP,
-				MemoryPercent:        memP,
-				OverallSystemCPU:     overallCPUUsage,
-				PerCoreSystemCPU:     perCorePercentages,
-				TotalSystemMemUsedGB: totalMemUsedGB,
-			})
+			if len(threads) > 0 {
+				for tid, threadStat := range threads {
+					records = append(records, dataRecord{
+						Timestamp:             currentTime.Format(time.RFC3339),
+						PID:                   pid,
+						PPID:                  ppid,
+						ThreadID:              tid,
+						ProcessName:           info.Name, // Use the stored name for consistency
+						ProcessStartTime:      info.StartTime.Format(time.RFC3339),
+						ProcessPlatformStatus: platformStatus,
+						NumThreads:            numThreads,
+						Status:                "Active",
+						CPUPercent:            cpuP,
+						MemoryPercent:         memP,
+						ThreadUserTime:        threadStat.User,
+						ThreadSystemTime:      threadStat.System,
+						OverallSystemCPU:      overallCPUUsage,
+						PerCoreSystemCPU:      perCorePercentages,
+						TotalSystemMemUsedGB:  totalMemUsedGB,
+					})
+				}
+			} else {
+				// If no threads are found (or on error), log a single process-level record.
+				records = append(records, dataRecord{
+					Timestamp:             currentTime.Format(time.RFC3339),
+					PID:                   pid,
+					PPID:                  ppid,
+					ProcessName:           info.Name,
+					ProcessStartTime:      info.StartTime.Format(time.RFC3339),
+					ProcessPlatformStatus: platformStatus,
+					NumThreads:            numThreads,
+					Status:                "Active",
+					CPUPercent:            cpuP,
+					MemoryPercent:         memP,
+					OverallSystemCPU:      overallCPUUsage,
+					PerCoreSystemCPU:      perCorePercentages,
+					TotalSystemMemUsedGB:  totalMemUsedGB,
+				})
+			}
 		} else {
 			// It's a NEW process. Log it as "Started".
-			name, _ := p.Name()
-			records = append(records, dataRecord{
-				Timestamp:            currentTime.Format(time.RFC3339),
-				PID:                  pid,
-				ProcessName:          name,
-				Status:               "Started",
-				CPUPercent:           cpuP,
-				MemoryPercent:        memP,
-				OverallSystemCPU:     overallCPUUsage,
-				PerCoreSystemCPU:     perCorePercentages,
-				TotalSystemMemUsedGB: totalMemUsedGB,
-			})
+			name, _ := p.Exe()
+			createTimeMs, err := p.CreateTime()
+			var startTime time.Time
+			if err != nil {
+				startTime = currentTime // Fallback to current time
+			} else {
+				startTime = time.Unix(0, createTimeMs*int64(time.Millisecond))
+			}
+
+			if len(threads) > 0 {
+				for tid, threadStat := range threads {
+					records = append(records, dataRecord{
+						Timestamp:             currentTime.Format(time.RFC3339),
+						PID:                   pid,
+						PPID:                  ppid,
+						ThreadID:              tid,
+						ProcessName:           name,
+						ProcessStartTime:      startTime.Format(time.RFC3339),
+						ProcessPlatformStatus: platformStatus,
+						NumThreads:            numThreads,
+						Status:                "Started",
+						CPUPercent:            cpuP,
+						MemoryPercent:         memP,
+						ThreadUserTime:        threadStat.User,
+						ThreadSystemTime:      threadStat.System,
+						OverallSystemCPU:      overallCPUUsage,
+						PerCoreSystemCPU:      perCorePercentages,
+						TotalSystemMemUsedGB:  totalMemUsedGB,
+					})
+				}
+			} else {
+				// If no threads are found (or on error), log a single process-level record.
+				records = append(records, dataRecord{
+					Timestamp:             currentTime.Format(time.RFC3339),
+					PID:                   pid,
+					PPID:                  ppid,
+					ProcessName:           name,
+					ProcessStartTime:      startTime.Format(time.RFC3339),
+					ProcessPlatformStatus: platformStatus,
+					NumThreads:            numThreads,
+					Status:                "Started",
+					CPUPercent:            cpuP,
+					MemoryPercent:         memP,
+					OverallSystemCPU:      overallCPUUsage,
+					PerCoreSystemCPU:      perCorePercentages,
+					TotalSystemMemUsedGB:  totalMemUsedGB,
+				})
+			}
 			// Add to our tracking map
-			activeProcesses[pid] = processInfo{Name: name, StartTime: currentTime}
+			activeProcesses[pid] = processInfo{Name: name, StartTime: startTime, PPID: ppid}
 		}
 	}
 
@@ -242,11 +353,18 @@ func appendToCSV(data []dataRecord) error {
 		row := []string{
 			record.Timestamp,
 			strconv.Itoa(int(record.PID)),
+			strconv.Itoa(int(record.PPID)),
+			strconv.Itoa(int(record.ThreadID)),
 			record.ProcessName,
+			record.ProcessStartTime,
+			record.ProcessPlatformStatus,
+			strconv.Itoa(int(record.NumThreads)),
 			record.Status,
 			record.Duration,
 			strconv.FormatFloat(record.CPUPercent, 'f', 2, 64),
 			strconv.FormatFloat(float64(record.MemoryPercent), 'f', 2, 32),
+			strconv.FormatFloat(record.ThreadUserTime, 'f', 2, 64),
+			strconv.FormatFloat(record.ThreadSystemTime, 'f', 2, 64),
 			strconv.FormatFloat(record.OverallSystemCPU, 'f', 2, 64),
 		}
 
