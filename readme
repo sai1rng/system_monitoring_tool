@@ -1,0 +1,18 @@
+# Compile 
+
+`sh
+GOOS=windows GOARCH=amd64 go build -o system_monitor_win_extended.exe .
+`
+
+`sh
+GOOS=linux GOARCH=amd64 go build -o system_monitor_linux_extended .
+`
+
+# running
+
+`sh
+./system_monitor_linux_extended -interval 10ms -verbose true 
+`
+`sh
+./system_monitor_win_extended -interval 10ms -verbose true 
+`
