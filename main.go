@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime"
@@ -43,7 +45,7 @@ type dataRecord struct {
 }
 
 const (
-	logInterval = 1 * time.Millisecond // How often to collect data
+	timestampFormat = "2006-01-02T15:04:05.000Z07:00"
 )
 
 var (
@@ -51,14 +53,29 @@ var (
 	activeProcesses = make(map[int32]processInfo)
 	// csvFilename is set at runtime to be unique for each execution.
 	csvFilename string
+	// logInterval is how often to collect data, set via command-line flag.
+	logInterval time.Duration
 )
 
 func main() {
+	verbose := flag.Bool("verbose", false, "Enable verbose logging to standard error.")
+	flag.DurationVar(&logInterval, "interval", 1*time.Millisecond, "How often to collect data (e.g., '500ms', '1s')")
+	flag.Parse()
+
+	if !*verbose {
+		log.SetOutput(io.Discard)
+	}
+
 	// Set a unique filename at the start of the program.
 	csvFilename = fmt.Sprintf("system_log_%s.csv", time.Now().Format("20060102_150405"))
 
 	log.Println("Starting system monitor...")
 	log.Printf("Data will be collected every %v and saved to %s", logInterval, csvFilename)
+	// Always show essential startup information using fmt.
+	fmt.Println("Starting system monitor...")
+	fmt.Printf("Data will be collected every %v and saved to %s\n", logInterval, csvFilename)
+
+	// This log message will only appear in verbose mode.
 	log.Printf("Detected %d CPU cores.", runtime.NumCPU())
 
 	initializeCSV()
@@ -185,13 +202,13 @@ func collectAndLogData() {
 	// Check for EXITED processes
 	for pid, info := range activeProcesses {
 		if _, exists := currentPIDs[pid]; !exists {
-			duration := currentTime.Sub(info.StartTime).Round(time.Millisecond).String()
+			duration := time.Since(info.StartTime).Round(time.Millisecond).String()
 			records = append(records, dataRecord{
-				Timestamp:        currentTime.Format(time.RFC3339),
+				Timestamp:        currentTime.Format(timestampFormat),
 				PID:              pid,
 				PPID:             info.PPID,
 				ProcessName:      info.Name,
-				ProcessStartTime: info.StartTime.Format(time.RFC3339),
+				ProcessStartTime: info.StartTime.Format(timestampFormat),
 				Status:           "Exited",
 				Duration:         duration,
 			})
@@ -223,12 +240,12 @@ func collectAndLogData() {
 			if len(threads) > 0 {
 				for tid, threadStat := range threads {
 					records = append(records, dataRecord{
-						Timestamp:             currentTime.Format(time.RFC3339),
+						Timestamp:             currentTime.Format(timestampFormat),
 						PID:                   pid,
 						PPID:                  ppid,
 						ThreadID:              tid,
 						ProcessName:           info.Name, // Use the stored name for consistency
-						ProcessStartTime:      info.StartTime.Format(time.RFC3339),
+						ProcessStartTime:      info.StartTime.Format(timestampFormat),
 						ProcessPlatformStatus: platformStatus,
 						NumThreads:            numThreads,
 						Status:                "Active",
@@ -244,11 +261,11 @@ func collectAndLogData() {
 			} else {
 				// If no threads are found (or on error), log a single process-level record.
 				records = append(records, dataRecord{
-					Timestamp:             currentTime.Format(time.RFC3339),
+					Timestamp:             currentTime.Format(timestampFormat),
 					PID:                   pid,
 					PPID:                  ppid,
 					ProcessName:           info.Name,
-					ProcessStartTime:      info.StartTime.Format(time.RFC3339),
+					ProcessStartTime:      info.StartTime.Format(timestampFormat),
 					ProcessPlatformStatus: platformStatus,
 					NumThreads:            numThreads,
 					Status:                "Active",
@@ -273,12 +290,12 @@ func collectAndLogData() {
 			if len(threads) > 0 {
 				for tid, threadStat := range threads {
 					records = append(records, dataRecord{
-						Timestamp:             currentTime.Format(time.RFC3339),
+						Timestamp:             currentTime.Format(timestampFormat),
 						PID:                   pid,
 						PPID:                  ppid,
 						ThreadID:              tid,
 						ProcessName:           name,
-						ProcessStartTime:      startTime.Format(time.RFC3339),
+						ProcessStartTime:      startTime.Format(timestampFormat),
 						ProcessPlatformStatus: platformStatus,
 						NumThreads:            numThreads,
 						Status:                "Started",
@@ -294,11 +311,11 @@ func collectAndLogData() {
 			} else {
 				// If no threads are found (or on error), log a single process-level record.
 				records = append(records, dataRecord{
-					Timestamp:             currentTime.Format(time.RFC3339),
+					Timestamp:             currentTime.Format(timestampFormat),
 					PID:                   pid,
 					PPID:                  ppid,
 					ProcessName:           name,
-					ProcessStartTime:      startTime.Format(time.RFC3339),
+					ProcessStartTime:      startTime.Format(timestampFormat),
 					ProcessPlatformStatus: platformStatus,
 					NumThreads:            numThreads,
 					Status:                "Started",
@@ -324,7 +341,7 @@ func collectAndLogData() {
 		log.Println("No running processes found. Logging heartbeat.")
 		// Log a "heartbeat" if there are no processes to log at all
 		heartbeatRecord := []dataRecord{{
-			Timestamp:            currentTime.Format(time.RFC3339),
+			Timestamp:            currentTime.Format(timestampFormat),
 			ProcessName:          "SYSTEM_HEARTBEAT",
 			Status:               "Heartbeat",
 			OverallSystemCPU:     overallCPUUsage,
