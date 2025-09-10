@@ -1,0 +1,203 @@
+package main
+
+
+
+import (
+  "encoding/csv"
+  "fmt"
+  "os"
+  "os/signal"
+  "strconv"
+  "syscall"
+  "time"
+
+
+
+  "github.com/shirou/gopsutil/cpu"
+  "github.com/shirou/gopsutil/mem"
+  "github.com/shirou/gopsutil/process"
+)
+
+
+
+func main() {
+  if len(os.Args) < 2 {
+    fmt.Println("Usage: go run main.go <PID1> <PID2> ...")
+    return
+  }
+
+
+
+  // Parse all PIDs
+  pids := make([]int32, 0, len(os.Args)-1)
+  for _, arg := range os.Args[1:] {
+    pid, err := strconv.Atoi(arg)
+    if err != nil {
+      fmt.Printf("Invalid PID '%s': %v\n", arg, err)
+      return
+    }
+    pids = append(pids, int32(pid))
+  }
+
+
+
+  // Create processes slice
+  processes := make([]*process.Process, 0, len(pids))
+  for _, pid := range pids {
+    proc, err := process.NewProcess(pid)
+    if err != nil {
+      fmt.Printf("Error finding process %d: %v\n", pid, err)
+      return
+    }
+    processes = append(processes, proc)
+  }
+
+
+
+  // Setup CSV file
+  filename := "process_metrics_multiple_pids.csv"
+  file, err := os.Create(filename)
+  if err != nil {
+    fmt.Println("Error creating CSV file:", err)
+    return
+  }
+  defer file.Close()
+  writer := csv.NewWriter(file)
+  defer writer.Flush()
+
+
+
+  // Get number of CPU cores to write header accordingly
+  numCores, err := cpu.Counts(true)
+  if err != nil {
+    fmt.Println("Error getting CPU core count:", err)
+    return
+  }
+
+
+
+  // Write header
+  header := []string{"Timestamp"}
+  for _, pid := range pids {
+    pidStr := strconv.Itoa(int(pid))
+    header = append(header,
+      fmt.Sprintf("PID_%s_CPU_%%", pidStr),
+      fmt.Sprintf("PID_%s_Memory_MB", pidStr),
+      fmt.Sprintf("PID_%s_Memory_Usage_%%", pidStr),
+      fmt.Sprintf("PID_%s_Num_Threads", pidStr),
+      fmt.Sprintf("PID_%s_CPU_User_Seconds", pidStr),
+      fmt.Sprintf("PID_%s_CPU_System_Seconds", pidStr),
+    )
+  }
+
+
+
+  // Add per-core CPU usage columns
+  for coreIdx := 0; coreIdx < numCores; coreIdx++ {
+    header = append(header, fmt.Sprintf("CPU_Core_%d_Usage_%%", coreIdx))
+  }
+
+
+
+  err = writer.Write(header)
+  if err != nil {
+    fmt.Println("Error writing CSV header:", err)
+    return
+  }
+
+
+
+  // Setup interrupt handling
+  sigs := make(chan os.Signal, 1)
+  signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+
+
+  fmt.Println("Logging metrics for PIDs:", pids)
+  fmt.Println("Press Ctrl+C to stop.")
+
+
+
+loop:
+  for {
+    select {
+    case <-sigs:
+      fmt.Println("\nInterrupt received. Exiting...")
+      break loop
+    default:
+      timestamp := time.Now().Format(time.RFC3339)
+
+
+
+      // Gather total virtual memory for usage %
+      vmem, err := mem.VirtualMemory()
+      if err != nil {
+        fmt.Println("Error getting virtual memory:", err)
+        return
+      }
+
+
+
+      row := []string{timestamp}
+
+
+
+      // For each process collect stats
+      for _, proc := range processes {
+        cpuPercent, _ := proc.CPUPercent()
+        memInfo, _ := proc.MemoryInfo()
+        numThreads, _ := proc.NumThreads()
+        cpuTimes, _ := proc.Times()
+
+
+
+        var memMB float64
+        var memPercent float64
+        if memInfo != nil {
+          memMB = float64(memInfo.RSS) / 1024 / 1024
+          memPercent = (float64(memInfo.RSS) / float64(vmem.Total)) * 100
+        }
+
+
+
+        row = append(row,
+          fmt.Sprintf("%.2f", cpuPercent),
+          fmt.Sprintf("%.2f", memMB),
+          fmt.Sprintf("%.2f", memPercent),
+          fmt.Sprintf("%d", numThreads),
+          fmt.Sprintf("%.2f", cpuTimes.User),
+          fmt.Sprintf("%.2f", cpuTimes.System),
+        )
+      }
+
+
+
+      // Get per-core CPU usage for the whole system
+      percentPerCore, err := cpu.Percent(0, true) // interval=0 means since last call or instantaneous
+      if err != nil {
+        fmt.Println("Error getting per-core CPU usage:", err)
+        return
+      }
+
+
+
+      for _, perc := range percentPerCore {
+        row = append(row, fmt.Sprintf("%.2f", perc))
+      }
+
+
+
+      err = writer.Write(row)
+      if err != nil {
+        fmt.Println("Error writing CSV row:", err)
+        return
+      }
+      writer.Flush()
+
+
+
+      time.Sleep(1 * time.Second)
+    }
+  }
+}
+ 
